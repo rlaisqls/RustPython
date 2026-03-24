@@ -4211,7 +4211,6 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         with self.assertRaises(TypeError):
             X.__bases__ = type(None), O
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_mutable_bases_with_failing_mro(self):
         # Testing mutable bases with failing mro...
         class WorkOnce(type):
@@ -5898,7 +5897,6 @@ class MroTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             B1.__bases__ += ()
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_tp_subclasses_cycle_in_update_slots(self):
         """
         type_set_bases must check for reentrancy upon finishing its job

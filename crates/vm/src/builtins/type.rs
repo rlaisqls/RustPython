@@ -581,23 +581,37 @@ impl PyType {
         linearise_mro(mros)
     }
 
-    /// Check for inheritance cycles by walking the __bases__ chain.
+    /// Check for inheritance cycles by walking the __bases__ chain (BFS).
     /// We walk __bases__ (not MRO) because during reentrant set_bases(),
     /// bases may already be updated while MRO is stale.
-    fn has_cycle_through_bases(target: &Py<Self>, current: &Py<Self>) -> bool {
-        if current.is(target) {
-            return true;
+    fn has_cycle_through_bases(target: &Py<Self>, start: &Py<Self>) -> bool {
+        let mut queue: Vec<PyTypeRef> = start.bases.read().clone();
+        let mut visited = HashSet::new();
+        while let Some(current) = queue.pop() {
+            if current.is(target) {
+                return true;
+            }
+            if visited.insert(current.get_id()) {
+                queue.extend(current.bases.read().iter().cloned());
+            }
         }
-        current
-            .bases
-            .read()
-            .iter()
-            .any(|b| Self::has_cycle_through_bases(target, b))
+        false
     }
 
-    /// Recursively update the MROs of all subclasses.
+    /// Recursively update MROs for a type and all its subclasses.
+    /// Applies each new MRO immediately (so subclass computations see the updated state).
+    /// Records (type, old_mro) pairs for rollback on failure.
     /// Clones the subclass list first to release the lock before calling Python code.
-    fn update_subclass_mros(cls: &Py<Self>, vm: &VirtualMachine) -> PyResult<()> {
+    fn mro_hierarchy(
+        cls: &Py<Self>,
+        vm: &VirtualMachine,
+        old_mros: &mut Vec<(PyTypeRef, Vec<PyTypeRef>)>,
+    ) -> PyResult<()> {
+        let old_mro = cls.mro.read().clone();
+        let new_mro = Self::mro_internal(cls, vm)?;
+        *cls.mro.write() = new_mro;
+        old_mros.push((cls.to_owned(), old_mro));
+
         let subclasses: Vec<_> = cls
             .subclasses
             .read()
@@ -606,11 +620,20 @@ impl PyType {
             .collect();
         for subclass in subclasses {
             let subclass: &Py<Self> = subclass.downcast_ref().unwrap();
-            let mro = Self::mro_internal(subclass, vm)?;
-            *subclass.mro.write() = mro;
-            Self::update_subclass_mros(subclass, vm)?;
+            Self::mro_hierarchy(subclass, vm, old_mros)?;
         }
         Ok(())
+    }
+
+    /// Check if a metaclass overrides `mro()` beyond the default `type.mro`.
+    fn has_custom_mro(metaclass: &Py<Self>, vm: &VirtualMachine) -> bool {
+        if metaclass.is(vm.ctx.types.type_type) {
+            return false;
+        }
+        let type_type = vm.ctx.types.type_type;
+        let mcl_mro = metaclass.find_name_in_mro(identifier!(vm, mro));
+        let type_mro = type_type.find_name_in_mro(identifier!(vm, mro));
+        !matches!((mcl_mro, type_mro), (Some(a), Some(b)) if a.is(&b))
     }
 
     /// Call the metaclass's mro() method if overridden, otherwise use C3 linearization.
@@ -619,19 +642,7 @@ impl PyType {
         type_obj: &Py<Self>,
         vm: &VirtualMachine,
     ) -> PyResult<Vec<PyTypeRef>> {
-        let metaclass = type_obj.class();
-
-        // Check if metaclass overrides mro() (different from type.mro)
-        let has_custom_mro = !metaclass.is(vm.ctx.types.type_type)
-            && !matches!(
-                (
-                    metaclass.find_name_in_mro(identifier!(vm, mro)),
-                    vm.ctx.types.type_type.find_name_in_mro(identifier!(vm, mro)),
-                ),
-                (Some(ref a), Some(ref b)) if a.is(b)
-            );
-
-        if has_custom_mro {
+        if Self::has_custom_mro(type_obj.class(), vm) {
             let mro_result = vm.call_method(type_obj.as_object(), "mro", ())?;
             Self::validate_custom_mro(type_obj, mro_result, vm)
         } else {
@@ -644,6 +655,7 @@ impl PyType {
     }
 
     /// Validate the result of a custom mro() call.
+    /// Checks: all elements are types, self is first, all __bases__ are present.
     fn validate_custom_mro(
         type_obj: &Py<Self>,
         mro_result: PyObjectRef,
@@ -662,7 +674,15 @@ impl PyType {
             })
             .collect::<PyResult<_>>()?;
 
-        // Validate: all __bases__ must appear in the MRO
+        // self must be the first element
+        if mro.first().is_none_or(|first| !first.is(type_obj)) {
+            return Err(vm.new_type_error(format!(
+                "mro() returned base with incompatible layout ('{}')",
+                type_obj.name()
+            )));
+        }
+
+        // All __bases__ must appear in the MRO
         for base in type_obj.bases.read().iter() {
             if !mro.iter().any(|m| m.is(base)) {
                 return Err(vm.new_type_error(format!(
@@ -1435,32 +1455,53 @@ impl PyType {
             }
         }
 
-        // TODO: Remove this class from all subclass lists
-        // for base in self.bases.read().iter() {
-        //     let subclasses = base.subclasses.write();
-        //     // TODO: how to uniquely identify the subclasses to remove?
-        // }
+        // Save old bases for rollback, then assign new bases
+        let old_bases = std::mem::replace(&mut *zelf.bases.write(), bases.clone());
 
-        *zelf.bases.write() = bases;
-        let mro = Self::mro_internal(zelf, vm)?;
-        *zelf.mro.write() = mro;
-        Self::update_subclass_mros(zelf, vm)?;
+        // Update MROs for this type and all subclasses (applied immediately).
+        // On failure, rollback MROs and bases.
+        let mut old_mros = Vec::new();
+        if let Err(e) = Self::mro_hierarchy(zelf, vm, &mut old_mros) {
+            for (typ, old_mro) in old_mros {
+                *typ.mro.write() = old_mro;
+            }
+            // Only restore bases if a reentrant set_bases hasn't changed them.
+            let current_bases = zelf.bases.read().clone();
+            if current_bases.len() == bases.len()
+                && current_bases.iter().zip(&bases).all(|(a, b)| a.is(b))
+            {
+                *zelf.bases.write() = old_bases;
+            }
+            return Err(e);
+        }
+
+        // MRO update succeeded — now update subclass registrations.
+        // Skip if a reentrant set_bases already changed bases (it handled its own subclass lists).
+        let current_bases = zelf.bases.read().clone();
+        let reentry_changed = current_bases.len() != bases.len()
+            || !current_bases.iter().zip(&bases).all(|(a, b)| a.is(b));
+        if !reentry_changed {
+            for base in old_bases.iter() {
+                base.subclasses.write().retain(|w| {
+                    w.upgrade()
+                        .is_some_and(|obj| !obj.is(zelf.as_object()))
+                });
+            }
+            let weakref_type = super::PyWeak::static_type();
+            for base in zelf.bases.read().iter() {
+                base.subclasses.write().push(
+                    zelf.as_object()
+                        .downgrade_with_weakref_typ_opt(None, weakref_type.to_owned())
+                        .unwrap(),
+                );
+            }
+        }
 
         // Invalidate inline caches
         zelf.modified();
 
         // TODO: do any old slots need to be cleaned up first?
         zelf.init_slots(&vm.ctx);
-
-        // Register this type as a subclass of its new bases
-        let weakref_type = super::PyWeak::static_type();
-        for base in zelf.bases.read().iter() {
-            base.subclasses.write().push(
-                zelf.as_object()
-                    .downgrade_with_weakref_typ_opt(None, weakref_type.to_owned())
-                    .unwrap(),
-            );
-        }
 
         Ok(())
     }
@@ -2197,7 +2238,7 @@ impl Constructor for PyType {
 
         // If metaclass has a custom mro(), call it.
         // new_heap_inner already set the default C3 MRO, so skip if not needed.
-        if !typ.class().is(vm.ctx.types.type_type) {
+        if Self::has_custom_mro(typ.class(), vm) {
             // Clear MRO so __mro__ returns None during the call
             // (matches CPython's tp_mro == NULL during mro_internal).
             let old_mro = std::mem::take(&mut *typ.mro.write());
@@ -2477,15 +2518,14 @@ impl GetAttr for PyType {
 impl Py<PyType> {
     #[pygetset]
     fn __mro__(&self, vm: &VirtualMachine) -> PyObjectRef {
-        // Collect under lock, build tuple outside
-        let elements: Vec<PyObjectRef> =
-            self.mro.read().iter().map(|x| x.as_object().to_owned()).collect();
-        if elements.is_empty() {
+        let mro = self.mro.read();
+        if mro.is_empty() {
             // MRO not yet computed (during type construction) — return None like CPython
-            vm.ctx.none()
-        } else {
-            PyTuple::new_unchecked(elements.into_boxed_slice()).into_pyobject(vm)
+            return vm.ctx.none();
         }
+        let elements: Vec<PyObjectRef> = mro.iter().map(|x| x.as_object().to_owned()).collect();
+        drop(mro);
+        PyTuple::new_unchecked(elements.into_boxed_slice()).into_pyobject(vm)
     }
 
     #[pygetset]

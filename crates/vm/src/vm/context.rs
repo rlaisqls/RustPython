@@ -187,6 +187,7 @@ declare_const_name! {
     __missing__,
     __mod__,
     __module__,
+    mro,
     __mro_entries__,
     __mul__,
     __name__,

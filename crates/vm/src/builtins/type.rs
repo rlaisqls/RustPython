@@ -567,11 +567,112 @@ impl PyType {
             }
         }
 
-        let mros = bases
-            .iter()
-            .map(|base| base.mro_map_collect(|t| t.to_owned()))
-            .collect();
+        let mut mros = Vec::with_capacity(bases.len());
+        for base in bases {
+            let base_mro = base.mro_map_collect(|t| t.to_owned());
+            if base_mro.is_empty() {
+                return Err(format!(
+                    "cannot extend incomplete type '{}'",
+                    base.name()
+                ));
+            }
+            mros.push(base_mro);
+        }
         linearise_mro(mros)
+    }
+
+    /// Check for inheritance cycles by walking the __bases__ chain.
+    /// We walk __bases__ (not MRO) because during reentrant set_bases(),
+    /// bases may already be updated while MRO is stale.
+    fn has_cycle_through_bases(target: &Py<Self>, current: &Py<Self>) -> bool {
+        if current.is(target) {
+            return true;
+        }
+        current
+            .bases
+            .read()
+            .iter()
+            .any(|b| Self::has_cycle_through_bases(target, b))
+    }
+
+    /// Recursively update the MROs of all subclasses.
+    /// Clones the subclass list first to release the lock before calling Python code.
+    fn update_subclass_mros(cls: &Py<Self>, vm: &VirtualMachine) -> PyResult<()> {
+        let subclasses: Vec<_> = cls
+            .subclasses
+            .read()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for subclass in subclasses {
+            let subclass: &Py<Self> = subclass.downcast_ref().unwrap();
+            let mro = Self::mro_internal(subclass, vm)?;
+            *subclass.mro.write() = mro;
+            Self::update_subclass_mros(subclass, vm)?;
+        }
+        Ok(())
+    }
+
+    /// Call the metaclass's mro() method if overridden, otherwise use C3 linearization.
+    /// This is the equivalent of CPython's mro_internal().
+    fn mro_internal(
+        type_obj: &Py<Self>,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<PyTypeRef>> {
+        let metaclass = type_obj.class();
+
+        // Check if metaclass overrides mro() (different from type.mro)
+        let has_custom_mro = !metaclass.is(vm.ctx.types.type_type)
+            && !matches!(
+                (
+                    metaclass.find_name_in_mro(identifier!(vm, mro)),
+                    vm.ctx.types.type_type.find_name_in_mro(identifier!(vm, mro)),
+                ),
+                (Some(ref a), Some(ref b)) if a.is(b)
+            );
+
+        if has_custom_mro {
+            let mro_result = vm.call_method(type_obj.as_object(), "mro", ())?;
+            Self::validate_custom_mro(type_obj, mro_result, vm)
+        } else {
+            let bases = type_obj.bases.read().clone();
+            let mut mro =
+                Self::resolve_mro(&bases).map_err(|msg| vm.new_type_error(msg))?;
+            mro.insert(0, type_obj.to_owned());
+            Ok(mro)
+        }
+    }
+
+    /// Validate the result of a custom mro() call.
+    fn validate_custom_mro(
+        type_obj: &Py<Self>,
+        mro_result: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<PyTypeRef>> {
+        let elements: Vec<PyObjectRef> = mro_result.try_to_value(vm)?;
+        let mro: Vec<PyTypeRef> = elements
+            .into_iter()
+            .map(|obj| {
+                obj.downcast::<PyType>().map_err(|obj| {
+                    vm.new_type_error(format!(
+                        "mro() returned a non-class ('{}')",
+                        obj.class().name()
+                    ))
+                })
+            })
+            .collect::<PyResult<_>>()?;
+
+        // Validate: all __bases__ must appear in the MRO
+        for base in type_obj.bases.read().iter() {
+            if !mro.iter().any(|m| m.is(base)) {
+                return Err(vm.new_type_error(format!(
+                    "mro() returned base with incompatible layout ('{}')",
+                    base.name()
+                )));
+            }
+        }
+
+        Ok(mro)
     }
 
     /// Inherit SEQUENCE and MAPPING flags from base classes
@@ -1326,7 +1427,13 @@ impl PyType {
             )));
         }
 
-        // TODO: check for mro cycles
+        for base in &bases {
+            if Self::has_cycle_through_bases(zelf, base) {
+                return Err(vm.new_type_error(
+                    "__bases__ assignment: there is a cycle through the bases".to_owned(),
+                ));
+            }
+        }
 
         // TODO: Remove this class from all subclass lists
         // for base in self.bases.read().iter() {
@@ -1335,21 +1442,9 @@ impl PyType {
         // }
 
         *zelf.bases.write() = bases;
-        // Recursively update the mros of this class and all subclasses
-        fn update_mro_recursively(cls: &PyType, vm: &VirtualMachine) -> PyResult<()> {
-            let mut mro =
-                PyType::resolve_mro(&cls.bases.read()).map_err(|msg| vm.new_type_error(msg))?;
-            // Preserve self (mro[0]) when updating MRO
-            mro.insert(0, cls.mro.read()[0].to_owned());
-            *cls.mro.write() = mro;
-            for subclass in cls.subclasses.write().iter() {
-                let subclass = subclass.upgrade().unwrap();
-                let subclass: &Py<PyType> = subclass.downcast_ref().unwrap();
-                update_mro_recursively(subclass, vm)?;
-            }
-            Ok(())
-        }
-        update_mro_recursively(zelf, vm)?;
+        let mro = Self::mro_internal(zelf, vm)?;
+        *zelf.mro.write() = mro;
+        Self::update_subclass_mros(zelf, vm)?;
 
         // Invalidate inline caches
         zelf.modified();
@@ -2100,6 +2195,21 @@ impl Constructor for PyType {
         )
         .map_err(|e| vm.new_type_error(e))?;
 
+        // If metaclass has a custom mro(), call it.
+        // new_heap_inner already set the default C3 MRO, so skip if not needed.
+        if !typ.class().is(vm.ctx.types.type_type) {
+            // Clear MRO so __mro__ returns None during the call
+            // (matches CPython's tp_mro == NULL during mro_internal).
+            let old_mro = std::mem::take(&mut *typ.mro.write());
+            match Self::mro_internal(&typ, vm) {
+                Ok(mro) => *typ.mro.write() = mro,
+                Err(e) => {
+                    *typ.mro.write() = old_mro;
+                    return Err(e);
+                }
+            }
+        }
+
         if let Some(ref slots) = heaptype_slots {
             let mut offset = base_member_count;
             let class_name = typ.name().to_string();
@@ -2366,9 +2476,16 @@ impl GetAttr for PyType {
 #[pyclass]
 impl Py<PyType> {
     #[pygetset]
-    fn __mro__(&self) -> PyTuple {
-        let elements: Vec<PyObjectRef> = self.mro_map_collect(|x| x.as_object().to_owned());
-        PyTuple::new_unchecked(elements.into_boxed_slice())
+    fn __mro__(&self, vm: &VirtualMachine) -> PyObjectRef {
+        // Collect under lock, build tuple outside
+        let elements: Vec<PyObjectRef> =
+            self.mro.read().iter().map(|x| x.as_object().to_owned()).collect();
+        if elements.is_empty() {
+            // MRO not yet computed (during type construction) — return None like CPython
+            vm.ctx.none()
+        } else {
+            PyTuple::new_unchecked(elements.into_boxed_slice()).into_pyobject(vm)
+        }
     }
 
     #[pygetset]
@@ -2448,8 +2565,15 @@ impl Py<PyType> {
     }
 
     #[pymethod]
-    fn mro(&self) -> Vec<PyObjectRef> {
-        self.mro_map_collect(|cls| cls.to_owned().into())
+    fn mro(&self, vm: &VirtualMachine) -> PyResult<Vec<PyObjectRef>> {
+        // Like CPython's type_mro_impl: compute C3 linearization fresh
+        // (not just return stored MRO). This is important because custom
+        // mro() overrides call type.mro(cls) to get the default C3 result.
+        let bases = self.bases.read().clone();
+        let mut mro =
+            PyType::resolve_mro(&bases).map_err(|msg| vm.new_type_error(msg))?;
+        mro.insert(0, self.to_owned());
+        Ok(mro.into_iter().map(|t| t.into()).collect())
     }
 }
 

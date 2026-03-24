@@ -5862,7 +5862,6 @@ class MroTest(unittest.TestCase):
         class C(B):
             pass
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_reent_set_bases_tp_base_cycle(self):
         """
         type_set_bases must check for an inheritance cycle not only through
@@ -5936,7 +5935,6 @@ class MroTest(unittest.TestCase):
         self.assertEqual(B1.__bases__, (C,))
         self.assertEqual(C.__subclasses__(), [B1])
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_tp_subclasses_cycle_error_return_path(self):
         """
         The same as test_tp_subclasses_cycle_in_update_slots, but tests
@@ -6005,7 +6003,6 @@ class MroTest(unittest.TestCase):
         class A(metaclass=M):
             pass
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_disappearing_custom_mro(self):
         """
         gh-92112: A custom mro() returning a result conflicting with

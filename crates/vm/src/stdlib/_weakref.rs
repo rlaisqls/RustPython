@@ -9,17 +9,29 @@ pub(crate) use _weakref::module_def;
 #[pymodule]
 mod _weakref {
     use crate::{
-        PyObjectRef, PyResult, VirtualMachine,
-        builtins::{PyDictRef, PyTypeRef, PyWeak},
+        PyObjectRef, PyPayload, PyResult, VirtualMachine,
+        builtins::{PyDictRef, PyTypeRef, PyWeak, PyWeakCallableProxy, PyWeakProxy},
+        function::OptionalArg,
     };
 
     #[pyattr(name = "ref")]
     fn ref_(vm: &VirtualMachine) -> PyTypeRef {
         vm.ctx.types.weakref_type.to_owned()
     }
-    #[pyattr]
-    fn proxy(vm: &VirtualMachine) -> PyTypeRef {
-        vm.ctx.types.weakproxy_type.to_owned()
+    #[pyfunction]
+    fn proxy(
+        referent: PyObjectRef,
+        callback: OptionalArg<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        let callback = callback.into_option();
+        if referent.is_callable() {
+            Ok(PyWeakCallableProxy::new(referent, callback, vm)?
+                .into_pyobject(vm))
+        } else {
+            Ok(PyWeakProxy::new(referent, callback, vm)?
+                .into_pyobject(vm))
+        }
     }
     #[pyattr(name = "ReferenceType")]
     fn reference_type(vm: &VirtualMachine) -> PyTypeRef {
@@ -31,7 +43,7 @@ mod _weakref {
     }
     #[pyattr(name = "CallableProxyType")]
     fn callable_proxy_type(vm: &VirtualMachine) -> PyTypeRef {
-        vm.ctx.types.weakproxy_type.to_owned()
+        vm.ctx.types.weakcallableproxy_type.to_owned()
     }
 
     #[pyfunction]

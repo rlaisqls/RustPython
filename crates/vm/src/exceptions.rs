@@ -2474,19 +2474,18 @@ pub(super) mod types {
     impl PyUnicodeDecodeError {
         #[pymethod]
         fn __str__(zelf: &Py<PyBaseException>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
-            let Ok(object) = zelf.as_object().get_attr("object", vm) else {
+            let Ok(_) = zelf.as_object().get_attr("object", vm) else {
                 return Ok(vm.ctx.empty_str.to_owned());
             };
-            let object: ArgBytesLike = object.try_into_value(vm)?;
-            let encoding: PyStrRef = zelf
-                .as_object()
-                .get_attr("encoding", vm)?
-                .try_into_value(vm)?;
+            let encoding_obj = zelf.as_object().get_attr("encoding", vm)?;
+            let reason_obj = zelf.as_object().get_attr("reason", vm)?;
             let start: usize = zelf.as_object().get_attr("start", vm)?.try_into_value(vm)?;
             let end: usize = zelf.as_object().get_attr("end", vm)?.try_into_value(vm)?;
-            let reason: PyStrRef = zelf
-                .as_object()
-                .get_attr("reason", vm)?
+            let bad_type_err = || vm.new_type_error("bad argument type for built-in operation".to_owned());
+            let encoding = encoding_obj.str(vm).map_err(|_| bad_type_err())?;
+            let reason = reason_obj.str(vm).map_err(|_| bad_type_err())?;
+            let object: ArgBytesLike = zelf.as_object().get_attr("object", vm)
+                .map_err(|_| bad_type_err())?
                 .try_into_value(vm)?;
             Ok(vm.ctx.new_str(if start < object.len() && end <= object.len() && end == start + 1 {
                 let b = object.borrow_buf()[start];
@@ -2531,19 +2530,19 @@ pub(super) mod types {
     impl PyUnicodeEncodeError {
         #[pymethod]
         fn __str__(zelf: &Py<PyBaseException>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
-            let Ok(object) = zelf.as_object().get_attr("object", vm) else {
+            let Ok(_) = zelf.as_object().get_attr("object", vm) else {
                 return Ok(vm.ctx.empty_str.to_owned());
             };
-            let object: PyStrRef = object.try_into_value(vm)?;
-            let encoding: PyStrRef = zelf
-                .as_object()
-                .get_attr("encoding", vm)?
-                .try_into_value(vm)?;
+            let encoding_obj = zelf.as_object().get_attr("encoding", vm)?;
+            let reason_obj = zelf.as_object().get_attr("reason", vm)?;
             let start: usize = zelf.as_object().get_attr("start", vm)?.try_into_value(vm)?;
             let end: usize = zelf.as_object().get_attr("end", vm)?.try_into_value(vm)?;
-            let reason: PyStrRef = zelf
-                .as_object()
-                .get_attr("reason", vm)?
+            let bad_type_err = || vm.new_type_error("bad argument type for built-in operation".to_owned());
+            // str() may trigger side effects that mutate object
+            let encoding = encoding_obj.str(vm).map_err(|_| bad_type_err())?;
+            let reason = reason_obj.str(vm).map_err(|_| bad_type_err())?;
+            let object: PyStrRef = zelf.as_object().get_attr("object", vm)
+                .map_err(|_| bad_type_err())?
                 .try_into_value(vm)?;
             Ok(vm.ctx.new_str(if start < object.char_len() && end <= object.char_len() && end == start + 1 {
                 let ch = object.as_wtf8().code_points().nth(start).unwrap();
@@ -2588,15 +2587,16 @@ pub(super) mod types {
     impl PyUnicodeTranslateError {
         #[pymethod]
         fn __str__(zelf: &Py<PyBaseException>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
-            let Ok(object) = zelf.as_object().get_attr("object", vm) else {
+            let Ok(_) = zelf.as_object().get_attr("object", vm) else {
                 return Ok(vm.ctx.empty_str.to_owned());
             };
-            let object: PyStrRef = object.try_into_value(vm)?;
+            let reason_obj = zelf.as_object().get_attr("reason", vm)?;
             let start: usize = zelf.as_object().get_attr("start", vm)?.try_into_value(vm)?;
             let end: usize = zelf.as_object().get_attr("end", vm)?.try_into_value(vm)?;
-            let reason: PyStrRef = zelf
-                .as_object()
-                .get_attr("reason", vm)?
+            let bad_type_err = || vm.new_type_error("bad argument type for built-in operation".to_owned());
+            let reason = reason_obj.str(vm).map_err(|_| bad_type_err())?;
+            let object: PyStrRef = zelf.as_object().get_attr("object", vm)
+                .map_err(|_| bad_type_err())?
                 .try_into_value(vm)?;
             Ok(vm.ctx.new_str(
                 if start < object.char_len() && end <= object.char_len() && end == start + 1 {

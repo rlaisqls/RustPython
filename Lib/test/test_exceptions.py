@@ -1307,7 +1307,6 @@ class ExceptionTests(unittest.TestCase):
         self.assertIs(exc, oe)
         self.assertIs(exc.__context__, ve)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_unicode_change_attributes(self):
         # See issue 7309. This was a crasher.
 
@@ -1375,13 +1374,11 @@ class ExceptionTests(unittest.TestCase):
                 exc = UnicodeDecodeError('utf-8', encoded, start, end, '')
                 self.assertIsInstance(str(exc), str)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_unicode_error_evil_str_set_none_object(self):
         def side_effect(exc):
             exc.object = None
         self.do_test_unicode_error_mutate(side_effect)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_unicode_error_evil_str_del_self_object(self):
         def side_effect(exc):
             del exc.object

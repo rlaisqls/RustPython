@@ -8,8 +8,8 @@ use crate::{
     protocol::{PyIter, PyIterReturn, PyMappingMethods, PyNumberMethods, PySequenceMethods},
     stdlib::builtins::reversed,
     types::{
-        AsMapping, AsNumber, AsSequence, Comparable, Constructor, GetAttr, Hashable, IterNext,
-        Iterable, PyComparisonOp, Representable, SetAttr,
+        AsMapping, AsNumber, AsSequence, Callable, Comparable, Constructor, GetAttr, Hashable,
+        IterNext, Iterable, PyComparisonOp, Representable, SetAttr,
     },
 };
 
@@ -67,13 +67,44 @@ impl PyWeakProxy {
         callback: Option<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult<PyRef<PyWeak>> {
-        let typ = vm.ctx.types.weakproxy_type.to_owned();
+        // PyWeakref_NewProxy: PyCallable_Check decides ProxyType vs
+        // CallableProxyType.
+        let typ = if referent.is_callable() {
+            vm.ctx.types.weakcallableproxy_type.to_owned()
+        } else {
+            vm.ctx.types.weakproxy_type.to_owned()
+        };
         referent.downgrade_with_typ(callback, typ, vm)
     }
 
     #[must_use]
     pub fn get_weak(&self) -> &PyWeak {
         &self.0
+    }
+}
+
+// PyCallable_Check(ob) ? CallableProxyType : ProxyType
+#[pyclass(
+    module = false,
+    name = "weakcallableproxy",
+    base = PyWeakProxy,
+    ctx = "weakcallableproxy_type",
+    unhashable = true
+)]
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct PyWeakCallableProxy(PyWeakProxy);
+
+#[pyclass(with(Callable))]
+impl PyWeakCallableProxy {}
+
+impl Callable for PyWeakCallableProxy {
+    type Args = FuncArgs;
+
+    // proxy_call: upgrade then delegate to the referent.
+    fn call(zelf: &Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        let obj = zelf.0.0.upgrade().ok_or_else(|| new_reference_error(vm))?;
+        obj.call(args, vm)
     }
 }
 
@@ -371,6 +402,7 @@ impl Representable for PyWeakProxy {
 
 pub(crate) fn init(context: &'static Context) {
     PyWeakProxy::extend_class(context, context.types.weakproxy_type);
+    PyWeakCallableProxy::extend_class(context, context.types.weakcallableproxy_type);
 }
 
 impl Hashable for PyWeakProxy {

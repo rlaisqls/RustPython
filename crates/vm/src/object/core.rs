@@ -621,7 +621,7 @@ impl WeakRefList {
             let existing = if is_generic {
                 unsafe { try_reuse_weakref(self.generic.load(Ordering::Relaxed)) }
             } else if is_generic_proxy {
-                unsafe { try_reuse_weakref(self.find_generic_proxy_ptr()) }
+                unsafe { try_reuse_weakref(self.find_generic_proxy_ptr(Some(&cls))) }
             } else {
                 None
             };
@@ -639,7 +639,7 @@ impl WeakRefList {
             callback: UnsafeCell::new(callback),
             hash: Radium::new(crate::common::hash::SENTINEL),
         };
-        let weak = PyRef::new_ref(weak_payload, cls, dict);
+        let weak = PyRef::new_ref(weak_payload, cls.clone(), dict);
 
         // Re-acquire lock for linked list insertion
         let _lock = weakref_lock::lock(obj as *const PyObject as usize);
@@ -650,7 +650,7 @@ impl WeakRefList {
         let existing = if is_generic {
             unsafe { try_reuse_weakref(self.generic.load(Ordering::Relaxed)) }
         } else if is_generic_proxy {
-            unsafe { try_reuse_weakref(self.find_generic_proxy_ptr()) }
+            unsafe { try_reuse_weakref(self.find_generic_proxy_ptr(Some(&cls))) }
         } else {
             None
         };
@@ -669,7 +669,7 @@ impl WeakRefList {
         } else if is_generic_proxy {
             NonNull::new(self.generic.load(Ordering::Relaxed))
         } else {
-            NonNull::new(self.find_generic_proxy_ptr())
+            NonNull::new(self.find_generic_proxy_ptr(None))
                 .or_else(|| NonNull::new(self.generic.load(Ordering::Relaxed)))
         };
         match after {
@@ -712,7 +712,7 @@ impl WeakRefList {
     }
 
     // get_basic_refs
-    fn find_generic_proxy_ptr(&self) -> *mut Py<PyWeak> {
+    fn find_generic_proxy_ptr(&self, verify_cls: Option<&Py<PyType>>) -> *mut Py<PyWeak> {
         let generic_ptr = self.generic.load(Ordering::Relaxed);
         let candidate_ptr = if let Some(generic_node) = NonNull::new(generic_ptr) {
             unsafe { WeakLink::pointers(generic_node).as_ref().get_next() }
@@ -724,11 +724,14 @@ impl WeakRefList {
             Some(candidate) => {
                 let node = unsafe { candidate.as_ref() };
                 let has_callback = unsafe { (&*node.0.payload.callback.get()).is_some() };
+                let node_cls = node.class();
                 // PyWeakref_CheckProxy: the basic-proxy slot is reserved for
-                // the canonical proxy type; subclasses and callback-less ref
+                // the canonical proxy types; subclasses and callback-less ref
                 // subclasses must not be mistaken for it.
-                let is_proxy = node.class().is(crate::builtins::PyWeakProxy::static_type());
-                if has_callback || !is_proxy {
+                let is_canonical_proxy = node_cls.is(crate::builtins::PyWeakProxy::static_type())
+                    || node_cls.is(crate::builtins::PyWeakCallableProxy::static_type());
+                let wrong_type = verify_cls.is_some_and(|cls| !node_cls.is(cls));
+                if has_callback || !is_canonical_proxy || wrong_type {
                     ptr::null_mut()
                 } else {
                     candidate_ptr
@@ -1525,7 +1528,8 @@ impl PyObject {
             None
         };
         let cls_is_weakref = typ.is(vm.ctx.types.weakref_type);
-        let cls_is_weakproxy = typ.is(vm.ctx.types.weakproxy_type);
+        let cls_is_weakproxy =
+            typ.is(vm.ctx.types.weakproxy_type) || typ.is(vm.ctx.types.weakcallableproxy_type);
         let wrl = self.weak_ref_list().ok_or_else(|| {
             vm.new_type_error(format!(
                 "cannot create weak reference to '{}' object",

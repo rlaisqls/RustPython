@@ -1186,16 +1186,17 @@ pub(crate) fn fire_jump(
 pub(crate) fn fire_branch_left(
     vm: &VirtualMachine,
     code: &Py<PyCode>,
-    offset: u32,
+    instr_offset: u32,
+    src_offset: u32,
     destination: u32,
 ) -> PyResult<()> {
     fire(
         vm,
         MonitoringEvent::BranchLeft,
         code,
-        offset,
+        instr_offset,
         &[
-            vm.ctx.new_int(offset).into(),
+            vm.ctx.new_int(src_offset).into(),
             vm.ctx.new_int(destination).into(),
         ],
     )

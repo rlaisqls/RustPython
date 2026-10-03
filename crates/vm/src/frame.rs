@@ -8172,7 +8172,13 @@ impl ExecutingFrame<'_> {
                 if continued {
                     if self.monitoring_mask & MonitoringEvent::BranchLeft.mask() != 0 {
                         let dest_offset = (self.lasti() + 1) * 2; // after caches
-                        monitoring::fire_branch_left(vm, self.code, src_offset, dest_offset)?;
+                        monitoring::fire_branch_left(
+                            vm,
+                            self.code,
+                            src_offset,
+                            src_offset,
+                            dest_offset,
+                        )?;
                     }
                 } else if self.monitoring_mask & MonitoringEvent::BranchRight.mask() != 0 {
                     // INSTRUMENTED_POP_ITER: dest is the instruction after
@@ -8278,9 +8284,16 @@ impl ExecutingFrame<'_> {
                     {
                         branch_idx -= 1;
                     }
+                    let not_taken_offset = (not_taken_idx as u32) * 2;
                     let src_offset = (branch_idx as u32) * 2;
                     let dest_offset = self.lasti() * 2;
-                    monitoring::fire_branch_left(vm, self.code, src_offset, dest_offset)?;
+                    monitoring::fire_branch_left(
+                        vm,
+                        self.code,
+                        not_taken_offset,
+                        src_offset,
+                        dest_offset,
+                    )?;
                 }
                 Ok(None)
             }
